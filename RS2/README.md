@@ -8,7 +8,8 @@ with MoveIt2, and executes them on the robot via URScript. The custom
 3D-printed end-effector holds **four markers** at 0°, 90°, 180°, 270°
 around the wrist axis. The user picks a single colour (red / blue /
 green / black) in the GUI; the motion node rotates the wrist to the
-matching slot and draws the entire artwork with that one marker.
+matching slot, keeps wrist_3 angle commands continuous, and draws the
+entire artwork with that one marker.
 
 For full system documentation (hardware setup, GUI/perception integration,
 troubleshooting), see [TECHNICAL_DOCUMENTATION.md](TECHNICAL_DOCUMENTATION.md).
@@ -29,6 +30,8 @@ For cross-subsystem topic flow and run modes, see
    part of the START command (`START:<colour>` on `/gui/command`). The
    motion node rotates wrist_3 to the slot matching that colour and
    draws every stroke with that one marker (red / blue / green / black).
+   Wrist targets are unwrapped between waypoints so the robot does not
+   spin the wrist through a full turn while the marker is touching the canvas.
 5. **Executes on the UR3** — Generates URScript and ships it over TCP
    (port 30002) to the real robot or Polyscope simulator.
 
@@ -140,7 +143,11 @@ Calibration constants live in `src/motion_planning_lib.py`:
 - `CANVAS_ORIGIN_ROBOT` — canvas top-left in robot base frame
 - `CANVAS_WIDTH_M`, `CANVAS_HEIGHT_M` — canvas size
 - `EE_DRAW_HEIGHT`, `MARKER_TILT_DEG` — marker holder geometry
-- `JOINT_VEL`, `LINEAR_VEL`, etc. — motion speeds
+- `JOINT_ACCEL=2.00`, `JOINT_VEL=2.50` — fast pen-up/travel `movej` profile
+- `LINEAR_ACCEL=1.20`, `LINEAR_VEL=0.35` — standalone `movel` script profile
+
+Pen-down drawing speed is set in `ur3_drawing_node.py`:
+- `DRAW_JOINT_ACCEL=1.10`, `DRAW_JOINT_VEL=0.70` — fast but restrained marker-contact `movej` profile
 
 ---
 
@@ -153,6 +160,7 @@ Calibration constants live in `src/motion_planning_lib.py`:
 | `move_group not available` | Wait ~25 s after launch — MoveIt2 takes a while to load |
 | Robot not moving on real UR3 | Set teach pendant to **Run Program** mode |
 | Wrong colour drawn | The mapping `colour → slot` is hard-coded in `COLOUR_TO_MARKER` in `ur3_drawing_node.py`. Either re-arrange the markers in the holder to match, or edit that dict. |
+| Wrist spins or smears while drawing | `ur3_drawing_node.py` unwraps wrist_3 targets to avoid ±π jumps. Rebuild and relaunch after updating; inspect `outputs/last_drawing.script` if an old generated script is being replayed. |
 | Pipeline never starts after Process | The motion node intentionally does **not** auto-start when perception strokes arrive — you must click **Start Drawing** in the GUI. Strokes are cached and used as soon as you press Start. |
 | Strokes off-canvas | Recalibrate `CANVAS_ORIGIN_ROBOT` in `src/motion_planning_lib.py` |
 | Strokes appear out of nowhere / robot freezes / topics from another team | `ROS_DOMAIN_ID` is wrong. **Every terminal** must `export ROS_DOMAIN_ID=42` before running anything. Verify with `echo $ROS_DOMAIN_ID`. |

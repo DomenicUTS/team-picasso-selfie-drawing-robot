@@ -175,7 +175,7 @@ python3 ~/gui/selfie_drawing_gui_ros2.py
 4. GUI shows preview of what will be drawn
 5. Click "Start Drawing" button
 6. Motion node receives strokes, plans collision-safe MoveIt2 trajectories, executes via URScript
-7. Robot draws the face at 20° angle using the **colour selected in the GUI** (red / blue / green / black). The wrist rotates once at the start to align the chosen marker with the canvas; the entire artwork is drawn in that single colour.
+7. Robot draws the face at 20° angle using the **colour selected in the GUI** (red / blue / green / black). The wrist rotates once at the start to align the chosen marker with the canvas; wrist_3 targets are then unwrapped for continuity and the entire artwork is drawn in that single colour.
 
 ### Mode 2: Perception + Motion with MoveIt2 (no GUI)
 
@@ -298,7 +298,7 @@ All three subsystems agree on this stroke format:
 | `ur3_motion_planning_moveit2.launch.py` | Updated to include scene setup (table + marker holder auto-published). |
 | `setup.py` | Added `scene_publisher` console script entry point. |
 | `setup.cfg` | **NEW** — Required for ROS 2 Python packages. Tells `colcon` to install entry point executables to `lib/ur3_motion_planning/` instead of `bin/` (needed for `ros2 run`). |
-| `motion_planning_lib.py` | No changes (20° tilt + 15cm EE height already configured). |
+| `motion_planning_lib.py` | Shared motion constants + stroke optimisation. Current fast profile: `JOINT_ACCEL=2.00`, `JOINT_VEL=2.50`, `LINEAR_ACCEL=1.20`, `LINEAR_VEL=0.35`; marker tilt is 20° with `EE_DRAW_HEIGHT=0.115 m`. |
 
 ---
 
@@ -337,7 +337,7 @@ Send via TCP socket → Robot (simulator or real)
 
 The marker is held in a **3D-printed angled holder** that:
 - Is bolted to the UR3 tool0 flange
-- Extends the marker tip **15 cm below the end effector** (0.150 m)
+- Extends the marker tip **11.5 cm below the end effector** along the holder axis (`EE_DRAW_HEIGHT=0.115 m`)
 - Is tilted **20° from perpendicular** (toward the camera)
 
 This creates a **TCP (Tool Center Point) offset** that must be known to both:
@@ -346,9 +346,9 @@ This creates a **TCP (Tool Center Point) offset** that must be known to both:
 
 **Offset values** (in robot base frame, in meters):
 ```
-TCP_X  = 0.0513 m  (forward, due to 20° tilt)
+TCP_X  = 0.0393 m  (forward, due to 20° tilt)
 TCP_Y  = 0.0 m     (centered)
-TCP_Z  = -0.1410 m (downward, 15 cm + geometry)
+TCP_Z  = -0.1081 m (downward component of 11.5 cm marker reach)
 Rotation = [20° around Y-axis]
 ```
 
@@ -367,7 +367,7 @@ Rotation = [20° around Y-axis]
 At the start of every URScript program:
 ```
 def draw_face():
-  set_tcp(p[0.0513, 0.0, -0.1410, 0.0, 0.3491, 0.0])
+  set_tcp(p[0.0393, 0.0, -0.1081, 0.0, 0.3491, 0.0])
   # ... rest of program ...
 end
 ```
@@ -386,6 +386,22 @@ The motion node uses that single marker for the entire artwork.
 orientation directly?** The holder is rotationally
 symmetric, so a constant offset on wrist_3 swings marker N into the
 position marker 1 was tracing and is robust against IK ambiguity.
+The node then unwraps each wrist_3 target to the equivalent angle
+nearest the previous command. This avoids ±π wrap jumps such as
+`+3.13 → -3.13`, which would otherwise command an almost full wrist
+rotation while drawing and smear the canvas.
+
+### Current Motion Speeds
+
+The integrated ROS node emits `movej` commands:
+
+| Motion type | Acceleration | Velocity | Source |
+|-------------|-------------:|---------:|--------|
+| Travel / pen-up / home | `2.00 rad/s²` | `2.50 rad/s` | `JOINT_ACCEL`, `JOINT_VEL` in `motion_planning_lib.py` |
+| Drawing / pen-down | `1.10 rad/s²` | `0.70 rad/s` | `DRAW_JOINT_ACCEL`, `DRAW_JOINT_VEL` in `ur3_drawing_node.py` |
+
+The standalone legacy `movel` path in `motion_planning_lib.py` uses
+`LINEAR_ACCEL=1.20 m/s²` and `LINEAR_VEL=0.35 m/s`.
 
 ### Why This Approach?
 
@@ -410,7 +426,7 @@ to match how you physically loaded the holder):
 | red    | 0          | 0°           | 0°                                |
 | blue   | 1          | 90°          | -90°                              |
 | green  | 2          | 180°         | -180°                             |
-| black  | 3          | 270°         | -270° (= +90° after ±2π wrap)     |
+| black  | 3          | 270°         | +90° (canonical equivalent of -270°) |
 
 Either physically load the markers so this mapping holds, or edit the
 dict in code to match the order you loaded.
@@ -430,7 +446,5 @@ is missing or shows the wrong colour, the chain is broken at that step.
 [GUI] ✓ Colour set to 'blue' (marker slot 2/4)
 [Plan] >>> Pipeline reading colour: 'blue' (marker_idx=1, wrist_3_offset=-90.0°)
 ```
-
-
 
 

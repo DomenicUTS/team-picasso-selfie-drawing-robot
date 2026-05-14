@@ -57,11 +57,11 @@ Z_TRAVEL  = CANVAS_SURFACE_Z + EE_DRAW_HEIGHT + 0.060          # pen-up (6 cm ab
 # This is positioned above the center of the canvas, rotated 60° left
 HOME_POS = np.array([0.277, 0.129, 0.230])   # rotated 60° CCW to match canvas position
 
-# Motion params (optimized for simulator speed)
-JOINT_ACCEL  = 0.97  # rad/s²  (higher mid acceleration)
-JOINT_VEL    = 1.10  # rad/s   (higher mid movement)
-LINEAR_ACCEL = 0.64  # m/s²    (higher mid acceleration)
-LINEAR_VEL   = 0.15  # m/s     (higher mid drawing speed)
+# Motion params (fast profile; pen-up moves stay below UR3 base-joint max speed)
+JOINT_ACCEL  = 2.00  # rad/s²  (travel / pen-up moves)
+JOINT_VEL    = 2.50  # rad/s   (travel / pen-up moves)
+LINEAR_ACCEL = 1.20  # m/s²    (standalone movel script path)
+LINEAR_VEL   = 0.35  # m/s     (standalone movel script path)
 
 # ── Tool orientation (tilted 20° for marker holder) ──
 # Rotation vector for URScript: base = Rx(π) (straight down),

@@ -141,6 +141,7 @@ else:
 # and TCP_OFFSET stay valid for every marker.
 MARKER_COUNT = 4
 MARKER_STEP_RAD = -math.pi / 2.0  # -90° around tool Z per marker
+TAU = 2.0 * math.pi
 
 # Map of GUI colour name → marker slot index (0–3) on the physical holder.
 # IMPORTANT: physically load the markers into the holder so this mapping
@@ -152,6 +153,16 @@ COLOUR_TO_MARKER = {
     "black": 3,
 }
 DEFAULT_COLOUR = "black"
+
+
+def _wrap_to_pi(angle: float) -> float:
+    """Return the equivalent angle in [-pi, pi)."""
+    return (angle + math.pi) % TAU - math.pi
+
+
+def _nearest_equivalent_angle(angle: float, reference: float) -> float:
+    """Return angle + k*2pi that is closest to reference."""
+    return reference + _wrap_to_pi(angle - reference)
 
 
 def _quat_mul(q1, q2):
@@ -189,6 +200,11 @@ JOINT_NAMES = [
 
 # Safe start/end pose. wrist_3_offset is applied relative to HOME_JOINTS[5].
 HOME_JOINTS = [1.047, -1.57, 1.57, -1.57, -1.57, 0.0]  # shoulder_pan 60° toward canvas
+
+# Pen-down drawing speed. Kept separate from JOINT_VEL/ACCEL so travel moves
+# can be quick while marker contact stays smooth and controlled.
+DRAW_JOINT_ACCEL = 1.10
+DRAW_JOINT_VEL = 0.70
 
 
 class UR3DrawingNode(Node):
@@ -637,7 +653,7 @@ class UR3DrawingNode(Node):
         # selected by rotating wrist_3 by `marker_idx * -90°`.
         colour = self._selected_colour
         marker_idx = COLOUR_TO_MARKER.get(colour, COLOUR_TO_MARKER[DEFAULT_COLOUR])
-        wrist_3_offset = marker_idx * MARKER_STEP_RAD  # applied as a post-step
+        wrist_3_offset = _wrap_to_pi(marker_idx * MARKER_STEP_RAD)  # applied as a post-step
         self.get_logger().info("=" * 60)
         self.get_logger().info(
             f"[Plan] >>> Pipeline reading colour: '{colour}' "
@@ -736,32 +752,45 @@ class UR3DrawingNode(Node):
         # position marker 1 was tracing. Tool0's origin lies on the
         # wrist_3 axis, so only the 6th joint needs to change — the
         # marker tip's world position is preserved by rotational symmetry.
-        if wrist_3_offset != 0.0:
-            shifted = []
-            for joints, is_travel, comment in all_segments:
-                new_joints = list(joints)
-                w = new_joints[5] + wrist_3_offset
-                # Normalise to [-π, π] so consecutive waypoints never differ
-                # by more than π — prevents random mid-drawing wrist spins.
-                w = (w + math.pi) % (2.0 * math.pi) - math.pi
-                new_joints[5] = w
-                shifted.append((new_joints, is_travel, comment))
-            all_segments = shifted
+        #
+        # Important: do not normalise each waypoint independently into
+        # [-pi, pi]. When MoveIt2 returns wrist_3 values that straddle the
+        # wrap boundary, independent normalisation can emit +3.13 followed
+        # by -3.13, which commands a full wrist spin while the pen is down.
+        # Instead, unwrap each target to the equivalent angle nearest the
+        # previous command so the marker stays continuous throughout a draw.
+        rotated_home = list(HOME_JOINTS)
+        rotated_home[5] = _nearest_equivalent_angle(
+            HOME_JOINTS[5] + wrist_3_offset, HOME_JOINTS[5])
 
+        shifted = []
+        previous_wrist = rotated_home[5]
+        max_wrist_step = 0.0
+        for joints, is_travel, comment in all_segments:
+            new_joints = list(joints)
+            w = _nearest_equivalent_angle(
+                float(new_joints[5]) + wrist_3_offset, previous_wrist)
+            max_wrist_step = max(max_wrist_step, abs(w - previous_wrist))
+            previous_wrist = w
+            new_joints[5] = w
+            shifted.append((new_joints, is_travel, comment))
+        all_segments = shifted
+
+        if wrist_3_offset != 0.0:
             # Prepend an explicit "rotate at home" movej so the wrist swaps
             # to the chosen marker BEFORE any horizontal motion (visible to
             # the operator). Other joints stay at HOME, only wrist_3 moves.
-            rotated_home = list(HOME_JOINTS)
-            w = HOME_JOINTS[5] + wrist_3_offset
-            w = (w + math.pi) % (2.0 * math.pi) - math.pi
-            rotated_home[5] = w
             self.get_logger().info(
                 f"[Plan] Wrist_3 offset {math.degrees(wrist_3_offset):+.1f}° "
-                f"applied; first move sets wrist_3 → {w:.3f} rad to "
-                f"align '{colour}' marker")
+                f"applied; first move sets wrist_3 → {rotated_home[5]:.3f} rad "
+                f"to align '{colour}' marker")
             all_segments = [
                 (rotated_home, True, f"align marker {marker_idx+1} ({colour})")
             ] + all_segments
+
+        self.get_logger().info(
+            f"[Plan] Continuous wrist_3 targets generated "
+            f"(max step {math.degrees(max_wrist_step):.1f}°)")
 
         self.get_logger().info(
             f"[Plan] {len(all_segments)} movej commands "
@@ -773,7 +802,7 @@ class UR3DrawingNode(Node):
     def _build_urscript(self, segments) -> str:
         """Serialise joint waypoints to a URScript program.
         Travel/lift movejs use JOINT_VEL/ACCEL.
-        Draw movejs use slower a=0.5/v=0.3 with a small blend radius
+        Draw movejs use slower DRAW_JOINT_* values with a small blend radius
         (r=0.002) for smooth lines — but the LAST draw point of a stroke
         has no blend so the robot stops cleanly before lifting."""
         lines = []
@@ -799,9 +828,9 @@ class UR3DrawingNode(Node):
                 # Last draw point = next segment is travel/lift (or this is the end).
                 is_last_draw = (idx + 1 >= len(segments) or segments[idx + 1][1])
                 if is_last_draw:
-                    lines.append(f"  movej([{j_str}], a=0.5, v=0.3)")
+                    lines.append(f"  movej([{j_str}], a={DRAW_JOINT_ACCEL}, v={DRAW_JOINT_VEL})")
                 else:
-                    lines.append(f"  movej([{j_str}], a=0.5, v=0.3, r=0.002)")
+                    lines.append(f"  movej([{j_str}], a={DRAW_JOINT_ACCEL}, v={DRAW_JOINT_VEL}, r=0.002)")
 
         lines.append("")
         # Return to HOME — also undoes the wrist_3 colour offset.

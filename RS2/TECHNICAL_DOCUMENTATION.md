@@ -49,7 +49,7 @@ robot or a Polyscope simulator.
 |---|-----------|-----------|-------|----------------|
 | 1 | **GUI + End-Effector** | `~/gui/` + 3D printed hardware | Mateusz | Webcam capture, drawing preview, START/STOP buttons, status feedback, marker holder design, compliant marker contact |
 | 2 | **Perception** | `~/perception/` | Nithish | Background removal → edge detection → stroke extraction |
-| 3 | **Motion Planning** | `~/RS2/` | Domenic | Stroke optimisation → MoveIt2 planning → URScript execution, **4-colour marker cycling** |
+| 3 | **Motion Planning** | `~/RS2/` | Domenic | Stroke optimisation → MoveIt2 planning → URScript execution, **single-colour marker selection** |
 
 **Key features:**
 - Browser-quality selfie capture with PySide6 GUI (live preview, retake, draw progress).
@@ -57,7 +57,7 @@ robot or a Polyscope simulator.
 - **Canny edge detection (σ=3)** with morphological gap-closing for clean strokes.
 - **Nearest-Neighbour TSP + 2-Opt** stroke ordering (~30% pen-up travel saved).
 - **MoveIt2 Cartesian planning** with table + marker-holder collision objects.
-- **User-selectable colour** (red / blue / green / black) chosen in the GUI; the wrist rotates once at the start to align the chosen marker, then the whole artwork is drawn in that single colour.
+- **User-selectable colour** (red / blue / green / black) chosen in the GUI; the wrist rotates once at the start to align the chosen marker, then the whole artwork is drawn in that single colour. Wrist targets are unwrapped between waypoints to prevent full-turn wrist spins while the marker is down.
 - Works against the **Polyscope simulator** and on the **real UR3** with a single launch flag.
 
 ---
@@ -240,7 +240,7 @@ Wait ~30 s for the Docker container to come up. Visit
 3. Perception runs (background removal → Canny → strokes); takes 2–4 s on CPU.
 4. GUI receives the stroke preview from `/drawing_preview_image` and shows the line drawing.
 5. Pick a colour from the **Colour** dropdown in the GUI (red / blue / green / black).
-6. Click **Start Drawing** → the GUI publishes the colour on `/gui/marker_colour` (for status consumers) and `START:<colour>` on `/gui/command` (the authoritative trigger). The motion node parses the colour out of the START command, rotates wrist_3 to the matching slot at the very start of the URScript, then plans + executes every stroke in that single colour.
+6. Click **Start Drawing** → the GUI publishes the colour on `/gui/marker_colour` (for status consumers) and `START:<colour>` on `/gui/command` (the authoritative trigger). The motion node parses the colour out of the START command, rotates wrist_3 to the matching slot at the very start of the URScript, unwraps wrist_3 targets for continuity, then plans + executes every stroke in that single colour.
 7. GUI status updates from `WAITING_FOR_PERCEPTION` → `OPTIMIZING_PATH` → `PLANNING_WITH_MOVEIT2` → `EXECUTING` → `COMPLETE`.
 
 > **Note — no auto-start.** The motion node intentionally does *not*
@@ -435,8 +435,9 @@ need for intermediate joint configs. For
 the draw call it keeps **every point** MoveIt2 produced (so the
 robot's `movej` chain follows the exact Cartesian path instead of
 joint-space-shortcutting through the canvas). The thinned segments
-are concatenated, the wrist_3 offset is applied, and the result is
-serialised to a single URScript program.
+are concatenated, the wrist_3 offset is applied, wrist_3 targets are
+unwrapped for continuity, and the result is serialised to a single
+URScript program.
 
 
 **Nodes:**
@@ -498,12 +499,19 @@ to get a slot index, and uses that for the entire drawing.
 Implementation: the trajectory is planned with marker 1's orientation
 (`TOOL_QUAT`) for every stroke — making the plan deterministic and
 independent of the chosen colour — and the wrist_3 offset for the
-chosen marker (`marker_idx × -90°`, with `±2π` wrap) is applied as a
+chosen marker (`marker_idx × -90°`, canonicalised to the nearest
+equivalent angle) is applied as a
 **post-processing step** that adds the offset to the 6th joint of
 every output waypoint. Because the holder is rotationally symmetric,
 that single-axis rotation physically swings the chosen marker into
 the position marker 1 was tracing — `CANVAS_ORIGIN_ROBOT`,
 `px_to_robot()`, and the URScript `set_tcp()` value all stay the same.
+
+After the offset is applied, each wrist_3 waypoint is unwrapped to the
+equivalent angle nearest the previous command. This preserves the same
+physical marker orientation while avoiding wrap-boundary jumps such as
+`+3.13 → -3.13`, which would otherwise command an almost full wrist
+rotation while the marker is touching the canvas.
 
 A separate "rotate-only" `movej` is prepended to the URScript so the
 wrist visibly swaps to the chosen marker before any horizontal motion
@@ -533,7 +541,7 @@ match your physical loading order):
 | `jump_threshold` | `5.0` | MoveIt2 joint-space jump filter |
 | `planning_timeout` | `30.0` | Per-stroke planning timeout (s) |
 
-**Calibration constants (in `~/RS2/src/motion_planning_lib.py`):**
+**Calibration and motion constants:**
 
 | Constant | Default | Description |
 |----------|---------|-------------|
@@ -541,7 +549,9 @@ match your physical loading order):
 | `CANVAS_WIDTH_M`, `CANVAS_HEIGHT_M` | `0.150 m, 0.120 m` | Canvas size |
 | `EE_DRAW_HEIGHT` | `0.115 m` | EE height above canvas surface |
 | `MARKER_TILT_DEG` | `20°` | Marker tilt from perpendicular |
-| `JOINT_VEL`, `LINEAR_VEL`, etc. | mid-speed | URScript motion params |
+| `JOINT_ACCEL`, `JOINT_VEL` | `2.00 rad/s²`, `2.50 rad/s` | Fast travel / pen-up `movej` profile |
+| `LINEAR_ACCEL`, `LINEAR_VEL` | `1.20 m/s²`, `0.35 m/s` | Standalone legacy `movel` script profile |
+| `DRAW_JOINT_ACCEL`, `DRAW_JOINT_VEL` | `1.10 rad/s²`, `0.70 rad/s` | Pen-down drawing `movej` profile in `ur3_drawing_node.py` |
 
 **Known limitations & assumptions:**
 - The colour-to-slot mapping (`COLOUR_TO_MARKER`) is hard-coded.
@@ -601,12 +611,17 @@ cd ~/RS2/ros2_ws && colcon build --packages-select ur3_motion_planning
 
 ### Motion speeds
 
-Three predefined levels in `motion_planning_lib.py`:
-- **Conservative** (real robot first runs): `(0.73, 0.80, 0.47, 0.10)`
-- **Mid** (current default): `(0.97, 1.10, 0.64, 0.15)`
-- **Maximum** (simulator only): `(1.20, 1.40, 0.80, 0.20)`
+Current fast profile:
 
-Tuple is `(JOINT_ACCEL, JOINT_VEL, LINEAR_ACCEL, LINEAR_VEL)`.
+| Motion type | Acceleration | Velocity | Defined in |
+|-------------|-------------:|---------:|------------|
+| Travel / pen-up / home `movej` | `2.00 rad/s²` | `2.50 rad/s` | `motion_planning_lib.py` (`JOINT_ACCEL`, `JOINT_VEL`) |
+| Drawing / pen-down `movej` | `1.10 rad/s²` | `0.70 rad/s` | `ur3_drawing_node.py` (`DRAW_JOINT_ACCEL`, `DRAW_JOINT_VEL`) |
+| Standalone legacy `movel` path | `1.20 m/s²` | `0.35 m/s` | `motion_planning_lib.py` (`LINEAR_ACCEL`, `LINEAR_VEL`) |
+
+Travel moves are intentionally faster than drawing moves. Drawing is
+kept lower to reduce marker chatter and preserve line quality while
+the marker is touching the canvas.
 
 ### Marker holder geometry
 
@@ -629,8 +644,9 @@ The collision-object dimensions are also defined in
 | `move_group` not available; `/compute_cartesian_path` unavailable | MoveIt2 still loading. Wait ≥ 25 s after launching. The launch file already includes a `TimerAction` delay for the scene + motion nodes, but the GUI / external triggers may need to wait too. |
 | `ConnectionRefusedError 192.168.56.101:30002` | You are trying to run the simulated version and Polyscope simulator isn't running. Start it: `ros2 run ur_client_library start_ursim.sh -m ur3`. |
 | Robot is connected but does nothing | Real UR3: pendant must be in **Run Program** mode |
-| Robot makes a protective stop on first move | Reduce motion params to **Conservative** (see §7). Verify `CANVAS_ORIGIN_ROBOT` is reachable. |
+| Robot makes a protective stop on first move | Reduce the motion speed constants in §7, especially `JOINT_ACCEL` / `JOINT_VEL` for pen-up travel. Verify `CANVAS_ORIGIN_ROBOT` is reachable. |
 | Strokes are drawn off the canvas | Recalibrate `CANVAS_ORIGIN_ROBOT` (see §7). |
+| Wrist spins while drawing / marker smears across the canvas | Rebuild and relaunch so `ur3_drawing_node.py` uses the wrist_3 continuity unwrapping. Do not replay an older `outputs/last_drawing.script` generated before the fix. |
 | Robot drew with the wrong colour | The mapping `colour name → holder slot` is in `COLOUR_TO_MARKER` in `ur3_drawing_node.py`. Either re-load the markers in the slot order matching the dict, or edit the dict to match your physical loading. |
 | Pipeline never starts after Process | The motion node intentionally does **not** auto-start when perception strokes arrive. Click **Start Drawing** in the GUI; strokes are cached and used as soon as you press it. |
 | GUI doesn't see the perception preview | Confirm `ROS_DOMAIN_ID=42` is set in the GUI terminal *and* the launch file does `SetEnvironmentVariable('ROS_DOMAIN_ID', '42')`. Both must match. |
