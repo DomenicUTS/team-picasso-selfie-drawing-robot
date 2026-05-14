@@ -741,9 +741,9 @@ class UR3DrawingNode(Node):
             for joints, is_travel, comment in all_segments:
                 new_joints = list(joints)
                 w = new_joints[5] + wrist_3_offset
-                while w < -2.0 * math.pi:
+                while w < -math.pi:
                     w += 2.0 * math.pi
-                while w > 2.0 * math.pi:
+                while w > math.pi:
                     w -= 2.0 * math.pi
                 new_joints[5] = w
                 shifted.append((new_joints, is_travel, comment))
@@ -754,9 +754,9 @@ class UR3DrawingNode(Node):
             # the operator). Other joints stay at HOME, only wrist_3 moves.
             rotated_home = list(HOME_JOINTS)
             w = HOME_JOINTS[5] + wrist_3_offset
-            while w < -2.0 * math.pi:
+            while w < -math.pi:
                 w += 2.0 * math.pi
-            while w > 2.0 * math.pi:
+            while w > math.pi:
                 w -= 2.0 * math.pi
             rotated_home[5] = w
             self.get_logger().info(
