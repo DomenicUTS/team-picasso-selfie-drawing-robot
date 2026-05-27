@@ -31,12 +31,9 @@
    - 7.2 [Perception Subsystem](#72-perception-subsystem)
    - 7.3 [Motion Planning Subsystem](#73-motion-planning-subsystem)
    - 7.4 [End-Effector / Marker Holder](#74-end-effector--marker-holder)
-8. [System Architecture Deep-Dive](#8-system-architecture-deep-dive)
+8. [Cross-Subsystem Interfaces](#8-cross-subsystem-interfaces)
    - 8.1 [Complete ROS 2 Topic Map](#81-complete-ros-2-topic-map)
    - 8.2 [Data format contract (stroke JSON)](#82-data-format-contract-stroke-json)
-   - 8.3 [MoveIt2 planning → URScript execution](#83-moveit2-planning--urscript-execution)
-   - 8.4 [Tilted tool & TCP offset](#84-tilted-tool--tcp-offset)
-   - 8.5 [Single-colour drawing & wrist_3 unwrapping](#85-single-colour-drawing--wrist_3-unwrapping)
 9. [Configuration & Calibration](#9-configuration--calibration)
 10. [Troubleshooting & FAQs](#10-troubleshooting--faqs)
 11. [Project Layout](#11-project-layout)
@@ -566,6 +563,39 @@ GUI ── /gui/command (START:<colour>) ─────► ur3_drawing_node.py 
                                              UR3 / Polyscope
 ```
 
+**Architecture: MoveIt2 plans, URScript executes.** The motion node uses a
+hybrid model — MoveIt2 does the *planning* (collision-aware Cartesian
+paths), URScript does the *execution* (movej commands sent over TCP):
+
+```
+Strokes (JSON)
+     ↓
+Optimise (NN + 2-Opt)
+     ↓
+Convert to Cartesian waypoints (xyz positions)
+     ↓
+Call /compute_cartesian_path (MoveIt2)  ← COLLISION-AWARE
+     ↓
+Planned joint-space trajectory
+     ↓
+Apply wrist_3 colour offset + unwrap
+     ↓
+Convert to URScript (movej commands)
+     ↓
+TCP socket → UR3 (simulator or real)
+```
+
+Why this split:
+
+- **Collision safety** — MoveIt2 knows about the table and the marker
+  holder, so it never plans paths that crash.
+- **Correct tool orientation** — the quaternion in each Cartesian
+  waypoint guarantees the 20° marker tilt is maintained throughout.
+- **Lightweight execution** — URScript over TCP works on both the
+  simulator and the real robot without depending on the UR action
+  server staying healthy. The last script can be inspected at
+  `outputs/last_drawing.script`.
+
 **How strokes become URScript (per-stroke, not all-at-once).** The node
 never hands MoveIt2 the whole drawing in one call. For each stroke it
 makes **three separate `/compute_cartesian_path` calls**:
@@ -588,6 +618,91 @@ the exact Cartesian path instead of joint-space-shortcutting through
 the canvas). The thinned segments are concatenated, the wrist_3 offset
 is applied, wrist_3 targets are unwrapped for continuity, and the
 result is serialised to a single URScript program.
+
+**Tilted tool & TCP offset.** The marker holder is bolted to `tool0`
+and extends the marker tip **11.5 cm below the flange** along the
+holder axis (`EE_DRAW_HEIGHT=0.115 m`), tilted **20° from
+perpendicular**. This creates a TCP offset that must be known to both
+planning and execution.
+
+Offset values (robot base frame, meters):
+
+```
+TCP_X  = 0.0393 m   (forward, due to 20° tilt)
+TCP_Y  = 0.0 m      (centred)
+TCP_Z  = -0.1081 m  (downward component of 11.5 cm marker reach)
+Rotation = [20° around Y-axis]
+```
+
+*How MoveIt2 knows about the offset.* The marker holder is published
+as an `AttachedCollisionObject` linked to `tool0`:
+
+```python
+attached = AttachedCollisionObject()
+attached.link_name = "tool0"
+attached.object = marker_holder_box
+attached.touch_links = ["tool0", "wrist_3_link"]   # ignore self-collision
+```
+
+MoveIt2 carries this collision shape with the end effector during
+planning, so paths avoid hitting objects with the marker.
+
+*How URScript applies the offset.* Every generated program begins:
+
+```
+def draw_face():
+  set_tcp(p[0.0393, 0.0, -0.1081, 0.0, 0.3491, 0.0])
+  # ... rest of program ...
+end
+```
+
+This is informational for the controller — the `movej` joint targets
+are already baked from MoveIt2's IK, so `set_tcp()` does not change
+the motion, but it keeps the pendant's TCP indicator correct.
+
+**Single-colour drawing & wrist_3 unwrapping.** The 3D-printed holder
+carries **four markers** at 0°, 90°, 180°, 270° around the wrist_3 axis,
+each tilted 20° outward.
+
+*Selection.* The GUI sends `START:<colour>` on `/gui/command`. The
+motion node parses the colour, looks it up in `COLOUR_TO_MARKER` to
+get a slot index, and uses that slot for the whole drawing.
+
+*Implementation.* The trajectory is planned with marker 1's orientation
+(`TOOL_QUAT`) for *every* stroke — making the plan deterministic and
+independent of the chosen colour. The wrist_3 offset for the chosen
+marker (`marker_idx × -90°`, canonicalised to the nearest equivalent
+angle) is then applied as a **post-processing step** that adds the
+offset to the 6th joint of every output waypoint. Because the holder
+is rotationally symmetric, that single-axis rotation physically
+swings the chosen marker into the position marker 1 was tracing —
+`CANVAS_ORIGIN_ROBOT`, `px_to_robot()`, and `set_tcp()` all stay the same.
+
+*Unwrapping.* After the offset is applied, each wrist_3 waypoint is
+unwrapped to the equivalent angle nearest the previous command. This
+preserves the same physical marker orientation but avoids
+wrap-boundary jumps such as `+3.13 → -3.13`, which would otherwise
+command an almost full wrist rotation while the marker is touching
+the canvas.
+
+A separate "rotate-only" `movej` is prepended to the URScript so the
+wrist visibly swaps to the chosen marker *before* any horizontal
+motion toward the canvas.
+
+Default colour-to-slot mapping (edit `COLOUR_TO_MARKER` in
+`ur3_drawing_node.py` to match your physical loading order):
+
+| Colour | Slot index | Holder angle | wrist_3 offset |
+|--------|-----------:|-------------:|---------------:|
+| red    | 0          | 0°           | 0° |
+| blue   | 1          | 90°          | -90° |
+| green  | 2          | 180°         | -180° |
+| black  | 3          | 270°         | +90° (canonical equivalent of -270°) |
+
+*Default colour* — if a `START` arrives without a suffix and no
+`/gui/marker_colour` was received, the motion node uses
+`DEFAULT_COLOUR` (currently `"black"`). This keeps file-mode and
+no-GUI test runs working.
 
 **Nodes:**
 
@@ -713,10 +828,13 @@ calibration error.
 
 ---
 
-## 8. System Architecture Deep-Dive
+## 8. Cross-Subsystem Interfaces
 
-This section is for the reader who wants to understand *why* the
-system is built the way it is, not just *how* to run it.
+The two contracts that all three subsystems share — the ROS 2 topic
+map and the stroke data format. (Implementation deep-dives that used
+to live here have moved into the relevant subsystem section: the
+MoveIt2 + URScript hybrid, the TCP offset, and the wrist_3 unwrapping
+are all in §7.3.)
 
 ### 8.1 Complete ROS 2 Topic Map
 
@@ -750,127 +868,6 @@ All three subsystems agree on this stroke format:
 Defined once. Do not introduce translation layers — change
 `CANVAS_PX_W/H` in both perception and motion if you ever need to
 resize.
-
-### 8.3 MoveIt2 planning → URScript execution
-
-The motion node **plans with MoveIt2 but executes with URScript**:
-
-```
-Strokes (JSON)
-     ↓
-Optimise (NN + 2-Opt)
-     ↓
-Convert to Cartesian waypoints (xyz positions)
-     ↓
-Call /compute_cartesian_path (MoveIt2)  ← COLLISION-AWARE
-     ↓
-Planned joint-space trajectory
-     ↓
-Apply wrist_3 colour offset + unwrap
-     ↓
-Convert to URScript (movej commands)
-     ↓
-TCP socket → UR3 (simulator or real)
-```
-
-**Why this hybrid?**
-
-- **Collision safety** — MoveIt2 knows about the table and the marker
-  holder, so it never plans paths that crash.
-- **Correct tool orientation** — the quaternion in each Cartesian
-  waypoint guarantees the 20° marker tilt is maintained throughout.
-- **Lightweight execution** — URScript over TCP works on both the
-  simulator and the real robot without depending on the UR action
-  server staying healthy. The last script can be inspected at
-  `outputs/last_drawing.script`.
-
-### 8.4 Tilted tool & TCP offset
-
-The marker holder is bolted to `tool0` and extends the marker tip
-**11.5 cm below the flange** along the holder axis (`EE_DRAW_HEIGHT=0.115 m`),
-tilted **20° from perpendicular**. This creates a TCP offset that
-must be known to both planning and execution.
-
-**Offset values** (robot base frame, meters):
-
-```
-TCP_X  = 0.0393 m   (forward, due to 20° tilt)
-TCP_Y  = 0.0 m      (centred)
-TCP_Z  = -0.1081 m  (downward component of 11.5 cm marker reach)
-Rotation = [20° around Y-axis]
-```
-
-**How MoveIt2 knows about the offset.** The marker holder is
-published as an `AttachedCollisionObject` linked to `tool0`:
-
-```python
-attached = AttachedCollisionObject()
-attached.link_name = "tool0"
-attached.object = marker_holder_box
-attached.touch_links = ["tool0", "wrist_3_link"]   # ignore self-collision
-```
-
-MoveIt2 carries this collision shape with the end effector during
-planning, so paths avoid hitting objects with the marker.
-
-**How URScript applies the offset.** Every generated program begins:
-
-```
-def draw_face():
-  set_tcp(p[0.0393, 0.0, -0.1081, 0.0, 0.3491, 0.0])
-  # ... rest of program ...
-end
-```
-
-This is informational for the controller — the `movej` joint targets
-are already baked from MoveIt2's IK, so `set_tcp()` does not change
-the motion, but it keeps the pendant's TCP indicator correct.
-
-### 8.5 Single-colour drawing & wrist_3 unwrapping
-
-The 3D-printed holder carries **four markers** at 0°, 90°, 180°, 270°
-around the wrist_3 axis, each tilted 20° outward.
-
-**Selection.** The GUI sends `START:<colour>` on `/gui/command`. The
-motion node parses the colour, looks it up in `COLOUR_TO_MARKER` to
-get a slot index, and uses that slot for the whole drawing.
-
-**Implementation.** The trajectory is planned with marker 1's
-orientation (`TOOL_QUAT`) for *every* stroke — making the plan
-deterministic and independent of the chosen colour. The wrist_3
-offset for the chosen marker (`marker_idx × -90°`, canonicalised to
-the nearest equivalent angle) is then applied as a **post-processing
-step** that adds the offset to the 6th joint of every output
-waypoint. Because the holder is rotationally symmetric, that
-single-axis rotation physically swings the chosen marker into the
-position marker 1 was tracing — `CANVAS_ORIGIN_ROBOT`, `px_to_robot()`,
-and `set_tcp()` all stay the same.
-
-**Unwrapping.** After the offset is applied, each wrist_3 waypoint is
-unwrapped to the equivalent angle nearest the previous command. This
-preserves the same physical marker orientation but avoids
-wrap-boundary jumps such as `+3.13 → -3.13`, which would otherwise
-command an almost full wrist rotation while the marker is touching
-the canvas.
-
-A separate "rotate-only" `movej` is prepended to the URScript so the
-wrist visibly swaps to the chosen marker *before* any horizontal
-motion toward the canvas.
-
-**Default colour-to-slot mapping** (edit `COLOUR_TO_MARKER` in
-`ur3_drawing_node.py` to match your physical loading order):
-
-| Colour | Slot index | Holder angle | wrist_3 offset |
-|--------|-----------:|-------------:|---------------:|
-| red    | 0          | 0°           | 0° |
-| blue   | 1          | 90°          | -90° |
-| green  | 2          | 180°         | -180° |
-| black  | 3          | 270°         | +90° (canonical equivalent of -270°) |
-
-**Default colour** — if a `START` arrives without a suffix and no
-`/gui/marker_colour` was received, the motion node uses
-`DEFAULT_COLOUR` (currently `"black"`). This keeps file-mode and
-no-GUI test runs working.
 
 ---
 
