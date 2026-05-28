@@ -424,6 +424,19 @@ status/debug consumers. The motion node's drawing pipeline does
 **not** rely on this topic — it uses the suffix in `START:<colour>`
 to avoid a callback-ordering race in the multi-threaded executor.
 
+**Button press behaviour:**
+
+| Button | Enabled when | Action |
+|--------|--------------|--------|
+| **Capture** | Live preview or finished state | Freezes the current webcam frame in the GUI so the operator can inspect it before processing. |
+| **Retake** | Photo captured or preview ready | Discards the captured/processed image and returns to live camera preview. |
+| **Process** | Photo captured | Publishes the captured frame to `/raw_image` in the ROS 2 GUI; perception then generates strokes and a preview. In the standalone GUI, it generates a local edge preview only. |
+| **Start Drawing** | Preview ready | Reads the selected colour, publishes it on `/gui/marker_colour`, then publishes `START:<colour>` on `/gui/command`. This is the only button that starts the motion pipeline. |
+| **Pause** | Drawing | Publishes `PAUSE` on `/gui/command` and moves the GUI into the paused state. |
+| **Resume** | Paused | Publishes `RESUME` on `/gui/command` and returns the GUI to the drawing state. |
+| **Stop** | Drawing or paused | Publishes `STOP` on `/gui/command` and marks the run as stopped. |
+| **Reset** | Any connected state | Clears progress, captured image, and preview, then returns the GUI to live preview for the next run. |
+
 **How to run independently:**
 
 ```bash
@@ -450,6 +463,7 @@ python3 ~/gui/selfie_drawing_gui_ros2.py
   visual placeholders and do not affect perception parameters yet.
 
 ---
+
 
 ### 7.2 Perception Subsystem
 
@@ -808,10 +822,21 @@ chosen marker with the canvas.
 The attachment is 3D-printed and bolts directly onto the UR3 tool
 flange using M6 bolts. It holds four markers at fixed angular positions
 (0°, 90°, 180°, 270°) and includes a compliant mechanism near the
-marker interface. This compliance maintains consistent marker contact
+marker interface. The markers are inserted from the top and secured in place using a stopper bracket, fixed in place using two M4 bolts per marker. This compliance maintains consistent marker contact
 with the drawing surface while limiting force on the marker tip,
 the paper, and the robot during small height variations or
 calibration error.
+
+**End-effector reference images:**
+
+<p align="center">
+  <img src="images/EE1.png" alt="Compliant mechanism crosssection view 1" width="48%">
+  <img src="images/EE2.png" alt="Compliant mechanism crosssection view 2" width="48%">
+</p>
+<p align="center"><em>Compliant mechanism crosssection</em></p>
+
+![End-effector mounted on the UR3 wrist](images/EE3.jpg)
+*End-effector showing the four-marker arrangement.*
 
 **Design requirements:**
 

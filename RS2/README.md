@@ -68,7 +68,7 @@ source /opt/ros/humble/setup.bash
 source ~/perception/install/setup.bash
 source ~/RS2/ros2_ws/install/setup.bash
 ros2 launch ur3_motion_planning integrated_pipeline.launch.py \
-  image_source:=gui launch_rviz:=true robot_ip:=192.168.56.101
+  image_source:=gui launch_rviz:=true robot_ip:=192.168.0.195 #change this to sim ip if using simulator
 ```
 
 Replace `192.168.56.101` with `192.168.0.195` for the real UR3.
